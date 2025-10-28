@@ -1,0 +1,16 @@
+name: post-kenko-news
+on:
+  schedule:
+    - cron: '0 0 * * *'   # UTC0時＝日本9時
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Post to Discord Webhook
+        run: |
+          curl -H "Content-Type: application/json" \
+               -d '{"content":"おはようございます☀️ 本日の健康経営ニュース（自動）"}' \
+               "${{ secrets.WEBHOOK_URL }}"
