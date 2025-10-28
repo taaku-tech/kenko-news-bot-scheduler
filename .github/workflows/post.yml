@@ -1,7 +1,7 @@
 name: post-kenko-news
 on:
   schedule:
-    - cron: '0 0 * * *'   # UTC0時＝日本9時
+    - cron: '0 0 * * *'   # UTC 0:00 = JST 09:00
   workflow_dispatch:
 
 jobs:
@@ -9,8 +9,110 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Post to Discord Webhook
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
         run: |
-          curl -H "Content-Type: application/json" \
-               -d '{"content":"おはようございます☀️ 本日の健康経営ニュース（自動）"}' \
-               "${{ secrets.WEBHOOK_URL }}"
+          npm init -y
+          npm install axios fast-xml-parser dayjs dayjs-plugin-utc dayjs-plugin-timezone
+
+      - name: Fetch and Post Health Management News
+        run: |
+          node << 'EOF'
+          // --- 依存 ---
+          const axios = require('axios');
+          const { XMLParser } = require('fast-xml-parser');
+          const dayjs = require('dayjs');
+          const utc = require('dayjs/plugin/utc');
+          const tz = require('dayjs/plugin/timezone');
+
+          dayjs.extend(utc);
+          dayjs.extend(tz);
+
+          // --- 設定 ---
+          const WEBHOOK_URL = process.env.WEBHOOK_URL;
+          const MAX_ITEMS = 5;
+          const FEEDS = [
+            "https://news.google.com/rss/search?q=%E5%81%A5%E5%BA%B7%E7%B5%8C%E5%96%B6&hl=ja&gl=JP&ceid=JP:ja",
+            "https://news.google.com/rss/search?q=%E5%81%A5%E5%BA%B7%E7%B5%8C%E5%96%B6+%E3%82%A6%E3%82%A7%E3%83%AB%E3%83%93%E3%83%BC%E3%82%A4%E3%83%B3%E3%82%B0&hl=ja&gl=JP&ceid=JP:ja"
+          ];
+
+          async function fetchNews() {
+            const parser = new XMLParser({ ignoreAttributes: false });
+            const now = dayjs().tz("Asia/Tokyo");
+            let items = [];
+
+            for (const url of FEEDS) {
+              try {
+                const { data } = await axios.get(url);
+                const xml = parser.parse(data);
+                const list = xml?.rss?.channel?.item ?? [];
+
+                for (const it of list) {
+                  const title = it.title ?? "";
+                  const link = it.link ?? "";
+                  const pub = dayjs(it.pubDate);
+
+                  // --- 健康経営関連の記事を判定 ---
+                  const related =
+                    title.includes("健康経営") ||
+                    title.includes("ウェルビーイング") ||
+                    title.includes("健康") && title.includes("企業");
+
+                  const within48h = now.diff(pub, "hour") <= 48;
+
+                  if (related && within48h) {
+                    items.push({
+                      title,
+                      link,
+                      source: it.source?.["#text"] ?? "News",
+                      published: pub.tz("Asia/Tokyo").format("MM/DD HH:mm")
+                    });
+                  }
+                }
+              } catch (err) {
+                console.error("RSS取得エラー:", url, err.message);
+              }
+            }
+
+            // 日付順で並べる
+            items = items
+              .sort((a, b) => (a.published < b.published ? 1 : -1))
+              .slice(0, MAX_ITEMS);
+
+            return items;
+          }
+
+          async function main() {
+            const items = await fetchNews();
+            const dateLabel = dayjs().tz("Asia/Tokyo").format("M月D日");
+
+            let text = `【健康経営ニュース - ${dateLabel}】\n`;
+
+            if (items.length === 0) {
+              text += "本日は関連ニュースが見つかりませんでした。\n";
+            } else {
+              text += items
+                .map(
+                  (i) =>
+                    `・${i.title}（${i.source}/${i.published}）\n${i.link}`
+                )
+                .join("\n\n");
+            }
+
+            text += "\n\n#健康経営 #ウェルビーイング";
+
+            await axios.post(
+              WEBHOOK_URL,
+              { content: text },
+              { headers: { "Content-Type": "application/json" } }
+            );
+          }
+
+          main();
+          EOF
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
