@@ -17,102 +17,72 @@ jobs:
       - name: Install dependencies
         run: |
           npm init -y
-          npm install axios fast-xml-parser dayjs dayjs-plugin-utc dayjs-plugin-timezone
+          npm install axios fast-xml-parser dayjs
 
       - name: Fetch and Post Health Management News
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
           node << 'EOF'
-          // --- 依存 ---
           const axios = require('axios');
           const { XMLParser } = require('fast-xml-parser');
           const dayjs = require('dayjs');
           const utc = require('dayjs/plugin/utc');
           const tz = require('dayjs/plugin/timezone');
+          dayjs.extend(utc); dayjs.extend(tz);
 
-          dayjs.extend(utc);
-          dayjs.extend(tz);
-
-          // --- 設定 ---
           const WEBHOOK_URL = process.env.WEBHOOK_URL;
-          const MAX_ITEMS = 5;
+          if (!WEBHOOK_URL) { console.error('WEBHOOK_URL is missing'); process.exit(1); }
+
           const FEEDS = [
             "https://news.google.com/rss/search?q=%E5%81%A5%E5%BA%B7%E7%B5%8C%E5%96%B6&hl=ja&gl=JP&ceid=JP:ja",
-            "https://news.google.com/rss/search?q=%E5%81%A5%E5%BA%B7%E7%B5%8C%E5%96%B6+%E3%82%A6%E3%82%A7%E3%83%AB%E3%83%93%E3%83%BC%E3%82%A4%E3%83%B3%E3%82%B0&hl=ja&gl=JP&ceid=JP:ja"
+            "https://news.google.com/rss/search?q=%E3%82%A6%E3%82%A7%E3%83%AB%E3%83%93%E3%83%BC%E3%82%A4%E3%83%B3%E3%82%B0+%E4%BC%81%E6%A5%AD&hl=ja&gl=JP&ceid=JP:ja"
           ];
+          const MAX_ITEMS = 5;
 
-          async function fetchNews() {
-            const parser = new XMLParser({ ignoreAttributes: false });
-            const now = dayjs().tz("Asia/Tokyo");
-            let items = [];
-
-            for (const url of FEEDS) {
-              try {
-                const { data } = await axios.get(url);
-                const xml = parser.parse(data);
-                const list = xml?.rss?.channel?.item ?? [];
-
-                for (const it of list) {
-                  const title = it.title ?? "";
-                  const link = it.link ?? "";
-                  const pub = dayjs(it.pubDate);
-
-                  // --- 健康経営関連の記事を判定 ---
-                  const related =
-                    title.includes("健康経営") ||
-                    title.includes("ウェルビーイング") ||
-                    title.includes("健康") && title.includes("企業");
-
-                  const within48h = now.diff(pub, "hour") <= 48;
-
-                  if (related && within48h) {
-                    items.push({
-                      title,
-                      link,
-                      source: it.source?.["#text"] ?? "News",
-                      published: pub.tz("Asia/Tokyo").format("MM/DD HH:mm")
-                    });
-                  }
-                }
-              } catch (err) {
-                console.error("RSS取得エラー:", url, err.message);
-              }
+          async function fetchFeed(url) {
+            try {
+              const { data } = await axios.get(url, { timeout: 15000 });
+              const parser = new XMLParser({ ignoreAttributes: false });
+              return parser.parse(data)?.rss?.channel?.item ?? [];
+            } catch (e) {
+              console.error('RSS fetch error:', url, e.message);
+              return [];
             }
+          }
 
-            // 日付順で並べる
-            items = items
-              .sort((a, b) => (a.published < b.published ? 1 : -1))
+          (async () => {
+            const now = dayjs().tz('Asia/Tokyo');
+            let items = [];
+            for (const url of FEEDS) items = items.concat(await fetchFeed(url));
+
+            const picked = items
+              .map(it => ({
+                title: it.title || '',
+                link: it.link || '',
+                source: it.source?.['#text'] || 'News',
+                pub: dayjs(it.pubDate || 0).tz('Asia/Tokyo'),
+              }))
+              .filter(i => {
+                const related = i.title.includes('健康経営') ||
+                                i.title.includes('ウェルビーイング') ||
+                                (i.title.includes('健康') && i.title.includes('企業'));
+                const within48h = now.diff(i.pub, 'hour') <= 48;
+                return related && within48h && i.link;
+              })
+              .sort((a,b)=> b.pub.valueOf() - a.pub.valueOf())
               .slice(0, MAX_ITEMS);
 
-            return items;
-          }
-
-          async function main() {
-            const items = await fetchNews();
-            const dateLabel = dayjs().tz("Asia/Tokyo").format("M月D日");
-
-            let text = `【健康経営ニュース - ${dateLabel}】\n`;
-
-            if (items.length === 0) {
-              text += "本日は関連ニュースが見つかりませんでした。\n";
+            const dateLabel = now.format('M月D日');
+            let content = `【健康経営ニュース - ${dateLabel}】\n`;
+            if (picked.length === 0) {
+              content += '本日は関連ニュースが見つかりませんでした。';
             } else {
-              text += items
-                .map(
-                  (i) =>
-                    `・${i.title}（${i.source}/${i.published}）\n${i.link}`
-                )
-                .join("\n\n");
+              content += picked.map(i => `・${i.title}（${i.source}/${i.pub.format('MM/DD HH:mm')}）\n${i.link}`).join('\n\n');
             }
+            content += '\n\n#健康経営 #ウェルビーイング';
 
-            text += "\n\n#健康経営 #ウェルビーイング";
-
-            await axios.post(
-              WEBHOOK_URL,
-              { content: text },
-              { headers: { "Content-Type": "application/json" } }
-            );
-          }
-
-          main();
+            await axios.post(WEBHOOK_URL, { content }, { headers: { 'Content-Type': 'application/json' } });
+            console.log('Posted', picked.length, 'items.');
+          })().catch(e => { console.error(e); process.exit(1); });
           EOF
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
